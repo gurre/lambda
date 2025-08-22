@@ -1,0 +1,20 @@
+---
+description: Golang rules
+globs: *.go
+alwaysApply: false
+---
+# Go Code styleguide
+ - Avoid returning nil values from functions, instead return empty structs or slices.
+ - Do not change interfaces without human approval.
+ - Prefer duplicated code over convoluted DRY refactoring.
+ - Comment EVERY method. Public methods must have usage examples and explain behaviours, errors and concurrency support.
+ 
+# Go Test Rules
+ - EVERYTIME you have changed the implementation run tests.
+ - Run linter and tests often with -race flag.
+ - In tests DO NOT use t.Run-loops, strive for isolated cases that clearly states what expectations wasn't met.
+ - In tests add comments that tells why an assertion is made.
+ - DO NOT use testing helping libraries such as testify except for integration tests with third parties.
+ - Test behaviour once and only make checks tied to behaviour. Prefer roundtrip tests over output matching and internal inspection.
+ - When tests are failing, first try to fix the test, if the implementation is the issue ask the user before modifying.
+ - Do not spend time optimizing the runtime performance of tests, focus tests which are easy to read and troubleshoot.
