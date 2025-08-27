@@ -1,6 +1,6 @@
 module github.com/gurre/lambda
 
-go 1.24.2
+go 1.24
 
 require github.com/json-iterator/go v1.1.12
 

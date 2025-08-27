@@ -3,7 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/gurre/lambda/log"
 	"github.com/gurre/lambda/runtime"
@@ -25,6 +29,9 @@ type Handler struct {
 	// cfg aws.Config
 	// writer *s3streamer.CompressedS3Writer
 }
+
+// cpuSink prevents the compiler from eliminating synthetic CPU work.
+var cpuSink uint64
 
 // NewHandler creates a new Handler with default configuration.
 func NewHandler() *Handler {
@@ -57,12 +64,31 @@ func (h *Handler) Validate(ctx context.Context, e Input) error {
 }
 
 func (h *Handler) Handler(ctx context.Context, e Input) (Output, error) {
-	// Access any environment variable via the All map
-	// if reqCtx, ok := runtime.FromContext(ctx); ok {
-	// 	h.log.Info(ctx, "request context", "aws_request_id", reqCtx.AwsRequestID)
-	// }
+	// Optional synthetic workload controls via input string:
+	//  - "sleep:<duration>" (e.g., sleep:50ms)
+	//  - "cpu:<duration>" busy loop (e.g., cpu:50ms)
+	if strings.HasPrefix(e.Input, "sleep:") {
+		d, err := time.ParseDuration(strings.TrimPrefix(e.Input, "sleep:"))
+		if err == nil {
+			time.Sleep(d)
+		}
+	}
+	if strings.HasPrefix(e.Input, "cpu:") {
+		d, err := time.ParseDuration(strings.TrimPrefix(e.Input, "cpu:"))
+		if err == nil {
+			end := time.Now().Add(d)
+			var x uint64 = 1469598103934665603
+			for time.Now().Before(end) {
+				// Simple busy work
+				x ^= 1099511628211
+				x *= 16777619
+			}
+			// Publish result to a global sink to prevent optimization.
+			atomic.AddUint64(&cpuSink, x|1)
+		}
+	}
 
-	return Output{Input: e.Input, Output: e.Input}, nil
+	return Output{Input: e.Input, Output: fmt.Sprintf("processed:%s", e.Input)}, nil
 }
 
 // Shutdown implements the Handler interface.

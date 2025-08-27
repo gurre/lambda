@@ -70,7 +70,7 @@ func BenchmarkRequestContextPooling(b *testing.B) {
 			_ = rc
 		}
 	})
-	
+
 	b.Run("Pooled-RequestContext", func(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
@@ -184,8 +184,7 @@ func BenchmarkBufferPooling(b *testing.B) {
 
 // BenchmarkRequestContext measures RequestContext optimization
 func BenchmarkRequestContext(b *testing.B) {
-	handler := &benchHandler{}
-	eventLoop := NewEventLoop[BenchEvent, BenchResponse](handler)
+	// Removed unused handler variable
 
 	b.Run("Original-Allocation", func(b *testing.B) {
 		b.ReportAllocs()
@@ -206,11 +205,13 @@ func BenchmarkRequestContext(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			ctx := context.Background()
-			eventLoop.requestContext.AwsRequestID = "req-123"
-			eventLoop.requestContext.InvokedFunctionArn = "arn:aws:lambda:us-east-1:123:function:test"
-			eventLoop.requestContext.TraceID = "trace-456"
-			eventLoop.requestContext.Deadline = time.Now().Add(5 * time.Minute)
-			_ = NewContext(ctx, &eventLoop.requestContext)
+			rc := GetPooledRequestContext()
+			rc.AwsRequestID = "req-123"
+			rc.InvokedFunctionArn = "arn:aws:lambda:us-east-1:123:function:test"
+			rc.TraceID = "trace-456"
+			rc.Deadline = time.Now().Add(5 * time.Minute)
+			_ = NewContext(ctx, rc)
+			ReturnPooledRequestContext(rc)
 		}
 	})
 }
@@ -270,10 +271,11 @@ func BenchmarkOverallPerformance(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			ctx := context.Background()
 
-			// Reuse RequestContext with cached environment
-			eventLoop.requestContext.AwsRequestID = "req-123"
-			eventLoop.requestContext.TraceID = "trace-456"
-			invokeCtx := NewContext(ctx, &eventLoop.requestContext)
+			// Reuse RequestContext with cached environment via pool
+			rc := GetPooledRequestContext()
+			rc.AwsRequestID = "req-123"
+			rc.TraceID = "trace-456"
+			invokeCtx := NewContext(ctx, rc)
 
 			// Reuse event buffer with optimized JSON
 			eventLoop.eventBuffer = BenchEvent{}
@@ -285,19 +287,20 @@ func BenchmarkOverallPerformance(b *testing.B) {
 
 			// Marshal with buffer pooling and optimized JSON
 			_, _ = eventLoop.marshalWithPool(result)
+			ReturnPooledRequestContext(rc)
 
 			// Error response is pre-allocated (no additional allocation)
 		}
 	})
-	
+
 	b.Run("Ultra-Optimized", func(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
-		
+
 		// Pre-allocate and reuse everything possible
 		rc := GetPooledRequestContext()
 		defer ReturnPooledRequestContext(rc)
-		
+
 		for i := 0; i < b.N; i++ {
 			ctx := context.Background()
 
@@ -324,21 +327,23 @@ func BenchmarkOverallPerformance(b *testing.B) {
 func BenchmarkMemoryFootprint(b *testing.B) {
 	handler := &benchHandler{}
 	eventLoop := NewEventLoop[BenchEvent, BenchResponse](handler)
-	
+
 	payload := []byte(`{"id": 42, "message": "test", "data": "dGVzdA==", "metadata": {}}`)
-	
+
 	b.Run("InvocationProcessing", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			ctx := context.Background()
-			
+
 			// Simulate complete invocation processing
-			eventLoop.requestContext.AwsRequestID = "req-123"
+			rc := GetPooledRequestContext()
+			rc.AwsRequestID = "req-123"
 			eventLoop.eventBuffer = BenchEvent{}
 			_ = eventLoop.unmarshalWithPool(payload, &eventLoop.eventBuffer)
-			
+
 			result, _ := handler.Handler(ctx, eventLoop.eventBuffer)
 			_, _ = eventLoop.marshalWithPool(result)
+			ReturnPooledRequestContext(rc)
 		}
 	})
 }

@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -39,6 +40,11 @@ var requestContextPool = sync.Pool{
 	},
 }
 
+// rcCleanQueue buffers returned RequestContexts to be cleaned asynchronously,
+// deferring work off the hot path. If the queue is full, cleanup falls back to
+// synchronous execution in ReturnPooledRequestContext.
+var rcCleanQueue = make(chan *RequestContext, 64)
+
 // RequestContext carries invocation metadata and AWS Lambda environment information.
 type RequestContext struct {
 	// Per-invocation fields
@@ -59,9 +65,9 @@ type RequestContext struct {
 	MemoryLimitInMB    int    // Configured memory limit for this Lambda instance
 	AWSExecutionEnv    string // Runtime identifier (e.g., AWS_Lambda_go1.x)
 	InitializationType string // Initialization type (on-demand, provisioned-concurrency, snap-start)
-	
+
 	// Performance optimization: flag to track if environment was already populated
-	envPopulated       bool   // Internal flag to avoid repeated environment reads
+	envPopulated bool // Internal flag to avoid repeated environment reads
 }
 
 // Use a string key to avoid circular import issues with context access
@@ -117,11 +123,59 @@ func initEnvironmentCache() {
 	envCache.logStreamName = os.Getenv("AWS_LAMBDA_LOG_STREAM_NAME")
 	envCache.awsExecutionEnv = os.Getenv("AWS_EXECUTION_ENV")
 	envCache.initializationType = os.Getenv("AWS_LAMBDA_INITIALIZATION_TYPE")
-	
+
 	// Parse memory limit once
 	if limit, err := strconv.Atoi(os.Getenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")); err == nil {
 		envCache.memoryLimitInMB = limit
 	}
+}
+
+// init prewarms the environment cache and the RequestContext pool, and starts
+// a background cleaner to defer cleanup work from the hot path.
+func init() {
+	// Pre-warm pool with a small number of map-initialized contexts (no env preload).
+	n := runtime.NumCPU()
+	if n < 2 {
+		n = 2
+	}
+	if n > 32 {
+		n = 32
+	}
+	for i := 0; i < n; i++ {
+		rc := &RequestContext{}
+		// Initialize maps to avoid allocations on first use per invocation.
+		rc.ClientContext.Env = make(map[string]string, 4)
+		rc.ClientContext.Custom = make(map[string]string, 4)
+		requestContextPool.Put(rc)
+	}
+
+	// Start async cleaner to reset per-invocation fields and reuse maps.
+	go func() {
+		for rc := range rcCleanQueue {
+			// Clear per-invocation fields (keep env metadata intact)
+			rc.AwsRequestID = ""
+			rc.InvokedFunctionArn = ""
+			rc.Deadline = time.Time{}
+			rc.TraceID = ""
+			rc.Identity = CognitoIdentity{}
+			// Reuse existing maps by deleting keys to avoid new allocations
+			if rc.ClientContext.Env == nil {
+				rc.ClientContext.Env = make(map[string]string, 4)
+			} else {
+				for k := range rc.ClientContext.Env {
+					delete(rc.ClientContext.Env, k)
+				}
+			}
+			if rc.ClientContext.Custom == nil {
+				rc.ClientContext.Custom = make(map[string]string, 4)
+			} else {
+				for k := range rc.ClientContext.Custom {
+					delete(rc.ClientContext.Custom, k)
+				}
+			}
+			requestContextPool.Put(rc)
+		}
+	}()
 }
 
 // PopulateFromEnvironment populates the RequestContext with AWS Lambda
@@ -130,7 +184,7 @@ func initEnvironmentCache() {
 func (rc *RequestContext) PopulateFromEnvironment() {
 	// Initialize environment cache only once
 	envCache.Do(initEnvironmentCache)
-	
+
 	// Copy from cache instead of calling os.Getenv repeatedly
 	rc.AWSRegion = envCache.awsRegion
 	rc.AWSDefaultRegion = envCache.awsDefaultRegion
@@ -141,39 +195,54 @@ func (rc *RequestContext) PopulateFromEnvironment() {
 	rc.AWSExecutionEnv = envCache.awsExecutionEnv
 	rc.InitializationType = envCache.initializationType
 	rc.MemoryLimitInMB = envCache.memoryLimitInMB
-	
+
 	rc.envPopulated = true
 }
 
 // GetPooledRequestContext returns a RequestContext from the pool with environment pre-populated
 func GetPooledRequestContext() *RequestContext {
 	rc := requestContextPool.Get().(*RequestContext)
-	
-	// Reset per-invocation fields
-	rc.AwsRequestID = ""
-	rc.InvokedFunctionArn = ""
-	rc.Deadline = time.Time{}
-	rc.TraceID = ""
-	rc.Identity = CognitoIdentity{}
-	rc.ClientContext = ClientContext{}
-	
-	// Populate environment if not already done
+	// Typical case: rc has been cleaned and pre-initialized by the async cleaner.
+	// Rare case: brand new rc from Pool.New() or GC cycle; initialize lazily.
 	if !rc.envPopulated {
 		rc.PopulateFromEnvironment()
+		if rc.ClientContext.Env == nil {
+			rc.ClientContext.Env = make(map[string]string, 4)
+		}
+		if rc.ClientContext.Custom == nil {
+			rc.ClientContext.Custom = make(map[string]string, 4)
+		}
 	}
-	
 	return rc
 }
 
 // ReturnPooledRequestContext returns a RequestContext to the pool
 func ReturnPooledRequestContext(rc *RequestContext) {
-	// Keep environment metadata but clear per-invocation fields
-	rc.AwsRequestID = ""
-	rc.InvokedFunctionArn = ""
-	rc.Deadline = time.Time{}
-	rc.TraceID = ""
-	rc.Identity = CognitoIdentity{}
-	rc.ClientContext = ClientContext{}
-	
-	requestContextPool.Put(rc)
+	// Defer cleanup off the hot path when possible.
+	select {
+	case rcCleanQueue <- rc:
+		// cleaned asynchronously
+	default:
+		// Fallback: channel full, clean synchronously to avoid unbounded growth.
+		rc.AwsRequestID = ""
+		rc.InvokedFunctionArn = ""
+		rc.Deadline = time.Time{}
+		rc.TraceID = ""
+		rc.Identity = CognitoIdentity{}
+		if rc.ClientContext.Env == nil {
+			rc.ClientContext.Env = make(map[string]string, 4)
+		} else {
+			for k := range rc.ClientContext.Env {
+				delete(rc.ClientContext.Env, k)
+			}
+		}
+		if rc.ClientContext.Custom == nil {
+			rc.ClientContext.Custom = make(map[string]string, 4)
+		} else {
+			for k := range rc.ClientContext.Custom {
+				delete(rc.ClientContext.Custom, k)
+			}
+		}
+		requestContextPool.Put(rc)
+	}
 }

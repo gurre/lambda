@@ -36,9 +36,8 @@ type EventLoop[T, R any] struct {
 	logger  log.Logger
 
 	// Optimizations: Pre-allocated reusable objects
-	requestContext RequestContext
-	errorResponse  ErrorResponse
-	eventBuffer    T
+	errorResponse ErrorResponse
+	eventBuffer   T
 
 	// Additional optimizations: Pre-allocated buffers and pools
 	jsoniter   jsoniter.API // Dedicated API instance
@@ -49,9 +48,6 @@ type EventLoop[T, R any] struct {
 
 func NewEventLoop[T, R any](h Handler[T, R]) *EventLoop[T, R] {
 	logger := log.New(log.LevelInfo, os.Stdout)
-
-	// Use pooled RequestContext with environment metadata pre-populated
-	requestContext := GetPooledRequestContext()
 
 	// Create dedicated jsoniter API instance for this EventLoop
 	jsonAPI := jsoniter.Config{
@@ -81,12 +77,10 @@ func NewEventLoop[T, R any](h Handler[T, R]) *EventLoop[T, R] {
 	}
 
 	e := &EventLoop[T, R]{
-		handler: h,
-		logger:  logger,
-		// Initialize reusable objects with environment data pre-populated
-		requestContext: *requestContext, // Dereference the pointer
-		errorResponse:  ErrorResponse{},
-		eventBuffer:    *new(T), // Zero value of type T
+		handler:       h,
+		logger:        logger,
+		errorResponse: ErrorResponse{},
+		eventBuffer:   *new(T), // Zero value of type T
 
 		// Performance optimizations
 		jsoniter:   jsonAPI,
@@ -95,8 +89,6 @@ func NewEventLoop[T, R any](h Handler[T, R]) *EventLoop[T, R] {
 		timeBuffer: time.Time{}, // Zero time to reuse
 	}
 
-	// Return the pooled RequestContext since we copied its value
-	ReturnPooledRequestContext(requestContext)
 	return e
 }
 
@@ -133,6 +125,8 @@ func (e *EventLoop[T, R]) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-sigCtx.Done():
+			// Must live inside the loop so we can react to termination BETWEEN invocations.
+			// Moving this outside would miss signals that arrive after startup and before/after Next().
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			if err := e.handler.Shutdown(shutdownCtx); err != nil {
 				e.logger.Error(context.Background(), "shutdown error", "error", err)
@@ -142,109 +136,209 @@ func (e *EventLoop[T, R]) Run(ctx context.Context) error {
 		default:
 		}
 
-		// Use a simple Next() call to retrieve the next invocation
+		// Per-invocation: Next() blocks until a unique event arrives.
+		// This cannot be performed outside the loop because each iteration
+		// corresponds to exactly one new invocation from the Runtime API.
+		pollStart := time.Now()
 		inv, nextErr := api.Next(sigCtx)
 		if nextErr != nil {
+			// Backoff must be applied per failure; doing this outside would either
+			// block the entire loop or backoff when not needed.
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
+		nextMs := time.Since(pollStart).Milliseconds()
 
-		// Build context with deadline and metadata - optimize context creation
+		// Per-invocation: The deadline and metadata vary for every invocation.
+		// Contexts are immutable and must be derived per call to carry the current deadline.
 		var (
 			invokeCtx context.Context
 			cancel    context.CancelFunc
 		)
-		// Reuse time buffer to avoid allocation if deadline is not critical precision
+		// Reuse time buffer to avoid allocation if deadline is not critical precision.
+		// This still must happen per-invocation since the deadline changes each time.
 		if !inv.Deadline.IsZero() {
 			e.timeBuffer = inv.Deadline
 			invokeCtx, cancel = context.WithDeadline(sigCtx, e.timeBuffer)
 		} else {
 			invokeCtx, cancel = context.WithCancel(sigCtx)
 		}
-		// Update per-invocation fields while preserving environment metadata
-		e.requestContext.AwsRequestID = inv.RequestID
-		e.requestContext.InvokedFunctionArn = inv.InvokedFunctionArn
-		e.requestContext.Deadline = inv.Deadline
-		e.requestContext.TraceID = inv.TraceID
-		// Clear per-invocation fields to avoid stale data - use zero values for efficiency
-		e.requestContext.Identity.CognitoIdentityID = ""
-		e.requestContext.Identity.CognitoIdentityPoolID = ""
-		e.requestContext.ClientContext.Client.InstallationID = ""
-		e.requestContext.ClientContext.Client.AppTitle = ""
-		e.requestContext.ClientContext.Client.AppVersionCode = ""
-		e.requestContext.ClientContext.Client.AppPackageName = ""
-		for k := range e.requestContext.ClientContext.Env {
-			delete(e.requestContext.ClientContext.Env, k)
-		}
-		for k := range e.requestContext.ClientContext.Custom {
-			delete(e.requestContext.ClientContext.Custom, k)
-		}
-		// Note: Environment metadata (AWSRegion, FunctionName, etc.) remains populated
+		// Get a cleaned RequestContext from the pool with environment pre-populated.
+		rc := GetPooledRequestContext()
+		// Per-invocation: Update request context with the current invocation metadata.
+		// These values differ for every request and cannot be computed once.
+		rc.AwsRequestID = inv.RequestID
+		rc.InvokedFunctionArn = inv.InvokedFunctionArn
+		rc.Deadline = inv.Deadline
+		rc.TraceID = inv.TraceID
+		// Per-invocation: Attach the RequestContext to the current invocation context.
+		invokeCtx = NewContext(invokeCtx, rc)
 
-		invokeCtx = NewContext(invokeCtx, &e.requestContext)
-
-		// Optimization: Reuse error response struct (clear previous values)
+		// Per-invocation: Reset reusable error struct to avoid stale error data.
 		e.errorResponse.ErrorMessage = ""
 		e.errorResponse.ErrorType = ""
 
-		// Optimization: Reuse event buffer with optimized JSON
+		// Per-invocation: Reset event buffer and unmarshal the new payload.
+		// Payloads differ per request and cannot be processed ahead of time.
 		e.eventBuffer = *new(T) // Reset to zero value
+		var (
+			unmarshalMs int64
+			validateMs  int64
+			handlerMs   int64
+			marshalMs   int64
+			postMs      int64
+		)
 		if len(inv.Payload) > 0 {
+			tUnmarshal := time.Now()
 			if err := e.unmarshalWithPool(inv.Payload, &e.eventBuffer); err != nil {
+				// Per-invocation: Error handling depends on the specific event and must
+				// be emitted for this invocation only.
 				e.errorResponse.ErrorMessage = err.Error()
 				e.errorResponse.ErrorType = "UnmarshalError"
+				tMarshal := time.Now()
 				body, _ := e.marshalWithPool(e.errorResponse)
+				marshalMs = time.Since(tMarshal).Milliseconds()
+				tPost := time.Now()
 				_ = api.Error(invokeCtx, inv.RequestID, body)
+				postMs = time.Since(tPost).Milliseconds()
+				unmarshalMs = time.Since(tUnmarshal).Milliseconds()
+				// Emit structured metrics for benchmarking and bottleneck analysis
+				e.logger.Info(invokeCtx, "invocation.metrics",
+					"request_id", inv.RequestID,
+					"outcome", "error",
+					"error_type", "UnmarshalError",
+					"next_ms", nextMs,
+					"unmarshal_ms", unmarshalMs,
+					"validate_ms", validateMs,
+					"handler_ms", handlerMs,
+					"marshal_ms", marshalMs,
+					"post_ms", postMs,
+					"total_ms", nextMs+unmarshalMs+validateMs+handlerMs+marshalMs+postMs,
+				)
 				if cancel != nil {
 					cancel()
 				}
+				ReturnPooledRequestContext(rc)
 				continue
 			}
+			unmarshalMs = time.Since(tUnmarshal).Milliseconds()
 		}
 
-		// Validate and skip processing on failure
+		// Per-invocation: Validation is event-specific; cannot be hoisted.
+		tValidate := time.Now()
 		if err := e.handler.Validate(invokeCtx, e.eventBuffer); err != nil {
 			e.errorResponse.ErrorMessage = err.Error()
 			e.errorResponse.ErrorType = "ValidationError"
+			tMarshal := time.Now()
 			body, _ := e.marshalWithPool(e.errorResponse)
+			marshalMs = time.Since(tMarshal).Milliseconds()
+			tPost := time.Now()
 			_ = api.Error(invokeCtx, inv.RequestID, body)
+			postMs = time.Since(tPost).Milliseconds()
+			validateMs = time.Since(tValidate).Milliseconds()
+			e.logger.Info(invokeCtx, "invocation.metrics",
+				"request_id", inv.RequestID,
+				"outcome", "error",
+				"error_type", "ValidationError",
+				"next_ms", nextMs,
+				"unmarshal_ms", unmarshalMs,
+				"validate_ms", validateMs,
+				"handler_ms", handlerMs,
+				"marshal_ms", marshalMs,
+				"post_ms", postMs,
+				"total_ms", nextMs+unmarshalMs+validateMs+handlerMs+marshalMs+postMs,
+			)
 			if cancel != nil {
 				cancel()
 			}
+			ReturnPooledRequestContext(rc)
 			continue
 		}
+		validateMs = time.Since(tValidate).Milliseconds()
 
-		// Process invocation
+		// Per-invocation: Execute the handler with the current event and context.
+		tHandler := time.Now()
 		result, err := e.handler.Handler(invokeCtx, e.eventBuffer)
+		handlerMs = time.Since(tHandler).Milliseconds()
 
 		if err != nil {
+			// Per-invocation: Map the error to a response for this specific request.
 			e.errorResponse.ErrorMessage = err.Error()
 			e.errorResponse.ErrorType = fmt.Sprintf("%T", err)
+			tMarshal := time.Now()
 			body, _ := e.marshalWithPool(e.errorResponse)
+			marshalMs = time.Since(tMarshal).Milliseconds()
 
+			tPost := time.Now()
 			_ = api.Error(invokeCtx, inv.RequestID, body)
+			postMs = time.Since(tPost).Milliseconds()
+			e.logger.Info(invokeCtx, "invocation.metrics",
+				"request_id", inv.RequestID,
+				"outcome", "error",
+				"error_type", fmt.Sprintf("%T", err),
+				"next_ms", nextMs,
+				"unmarshal_ms", unmarshalMs,
+				"validate_ms", validateMs,
+				"handler_ms", handlerMs,
+				"marshal_ms", marshalMs,
+				"post_ms", postMs,
+				"total_ms", nextMs+unmarshalMs+validateMs+handlerMs+marshalMs+postMs,
+			)
 			if cancel != nil {
 				cancel()
 			}
+			ReturnPooledRequestContext(rc)
 		} else {
+			// Per-invocation: Marshal the handler result for this specific request.
+			tMarshal := time.Now()
 			respBody, mErr := e.marshalWithPool(result)
+			marshalMs = time.Since(tMarshal).Milliseconds()
 
 			if mErr != nil {
 				e.errorResponse.ErrorMessage = mErr.Error()
 				e.errorResponse.ErrorType = "MarshalError"
+				tPost := time.Now()
 				body, _ := e.marshalWithPool(e.errorResponse)
 				_ = api.Error(invokeCtx, inv.RequestID, body)
+				postMs = time.Since(tPost).Milliseconds()
+				e.logger.Info(invokeCtx, "invocation.metrics",
+					"request_id", inv.RequestID,
+					"outcome", "error",
+					"error_type", "MarshalError",
+					"next_ms", nextMs,
+					"unmarshal_ms", unmarshalMs,
+					"validate_ms", validateMs,
+					"handler_ms", handlerMs,
+					"marshal_ms", marshalMs,
+					"post_ms", postMs,
+					"total_ms", nextMs+unmarshalMs+validateMs+handlerMs+marshalMs+postMs,
+				)
 				if cancel != nil {
 					cancel()
 				}
+				ReturnPooledRequestContext(rc)
 				continue
 			}
 
-			// Immediately POST the result
+			// Per-invocation: POST the response for this exact invocation only.
+			tPost := time.Now()
 			_ = api.Response(invokeCtx, inv.RequestID, respBody)
+			postMs = time.Since(tPost).Milliseconds()
+			e.logger.Info(invokeCtx, "invocation.metrics",
+				"request_id", inv.RequestID,
+				"outcome", "success",
+				"next_ms", nextMs,
+				"unmarshal_ms", unmarshalMs,
+				"validate_ms", validateMs,
+				"handler_ms", handlerMs,
+				"marshal_ms", marshalMs,
+				"post_ms", postMs,
+				"total_ms", nextMs+unmarshalMs+validateMs+handlerMs+marshalMs+postMs,
+			)
 			if cancel != nil {
 				cancel()
 			}
+			ReturnPooledRequestContext(rc)
 		}
 	}
 }
@@ -265,6 +359,7 @@ func Start[T, R any](h Handler[T, R]) {
 	loop := NewEventLoop(h)
 	if err := loop.Run(context.Background()); err != nil {
 		// If the event loop returns an error, exit non-zero to signal failure.
+		loop.logger.Error(context.Background(), "event loop error", "error", err.Error())
 		os.Exit(1)
 	}
 }
