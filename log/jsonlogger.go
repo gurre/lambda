@@ -3,8 +3,10 @@ package log
 import (
 	"context"
 	"io"
+	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	jsoniter "github.com/json-iterator/go"
 )
@@ -22,8 +24,17 @@ var JsoniterAPI = jsoniter.Config{
 // Pool for reusing map[string]any to reduce allocations
 var entryPool = sync.Pool{
 	New: func() interface{} {
-		// Pre-allocate with reasonable capacity for typical log entries
-		return make(map[string]any, 8)
+		// Pre-allocate with larger capacity for typical Lambda log entries
+		return make(map[string]any, 16)
+	},
+}
+
+// Pool for reusing string builders for timestamp formatting
+var timestampPool = sync.Pool{
+	New: func() interface{} {
+		builder := &strings.Builder{}
+		builder.Grow(32) // Pre-allocate for RFC3339Nano timestamp
+		return builder
 	},
 }
 
@@ -99,8 +110,17 @@ func (l *jsonLogger) log(ctx context.Context, level Level, msg string, fields ma
 		entryPool.Put(entry)
 	}()
 
+	// Optimize timestamp generation with pooled string builder
+	timestampBuilder := timestampPool.Get().(*strings.Builder)
+	timestampBuilder.Reset()
+	now := time.Now().UTC()
+	// Use faster timestamp formatting
+	timestampBuilder.WriteString(now.Format("2006-01-02T15:04:05.000000000Z"))
+	timestamp := timestampBuilder.String()
+	timestampPool.Put(timestampBuilder)
+
 	// Add core fields directly to avoid allocations
-	entry["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
+	entry["timestamp"] = timestamp
 	entry["level"] = levelToString(level)
 	entry["message"] = msg
 
@@ -128,8 +148,15 @@ func (l *jsonLogger) log(ctx context.Context, level Level, msg string, fields ma
 	// Ensure the stream is flushed to the underlying writer
 	if stream.Error != nil {
 		// Fallback to a simple error message if marshaling fails
-		fallbackMsg := `{"level":"ERROR","message":"failed to marshal log entry","timestamp":"` + time.Now().UTC().Format(time.RFC3339Nano) + `"}`
-		_, _ = l.out.Write([]byte(fallbackMsg))
+		// Use pooled timestamp builder for error case too
+		errorTimestampBuilder := timestampPool.Get().(*strings.Builder)
+		errorTimestampBuilder.Reset()
+		errorTimestampBuilder.WriteString(time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z"))
+		errorTimestamp := errorTimestampBuilder.String()
+		timestampPool.Put(errorTimestampBuilder)
+
+		fallbackMsg := `{"level":"ERROR","message":"failed to marshal log entry","timestamp":"` + errorTimestamp + `"}`
+		_, _ = l.out.Write(unsafeStringToBytes(fallbackMsg))
 	} else {
 		// Flush the stream to ensure all data is written
 		stream.Flush()
@@ -137,6 +164,11 @@ func (l *jsonLogger) log(ctx context.Context, level Level, msg string, fields ma
 
 	// Add newline
 	_, _ = l.out.Write([]byte{'\n'})
+}
+
+// Unsafe string-to-bytes conversion to avoid allocation when we know the string is immutable
+func unsafeStringToBytes(s string) []byte {
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 func (l *jsonLogger) Debug(ctx context.Context, msg string, args ...any) {
@@ -175,10 +207,10 @@ func parseArgs(args ...any) map[string]any {
 		}
 	}
 
-	// Pre-calculate capacity for key-value pairs
-	capacity := len(args) / 2
-	if capacity == 0 {
-		capacity = 1
+	// Pre-calculate capacity for key-value pairs with better sizing
+	capacity := (len(args) + 1) / 2 // Round up for odd number of args
+	if capacity < 4 {
+		capacity = 4 // Minimum capacity to reduce map reallocation
 	}
 
 	out := make(map[string]any, capacity)

@@ -4,9 +4,18 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 )
+
+// TestMain sets required environment for runtime API client tests.
+// AWS_LAMBDA_RUNTIME_API is required by NewClient; provide a dummy host:port.
+func TestMain(m *testing.M) {
+	_ = os.Setenv("AWS_LAMBDA_RUNTIME_API", "127.0.0.1:9001")
+	code := m.Run()
+	os.Exit(code)
+}
 
 // Test behavior: parseDeadline should correctly convert Unix ms header to time.Time
 func TestParseDeadline(t *testing.T) {

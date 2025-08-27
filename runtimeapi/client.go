@@ -1,13 +1,12 @@
 // Package runtimeapi provides a high-performance AWS Lambda Runtime API client.
-// This implementation is optimized for minimal latency with connection reuse,
-// proper HTTP transport configuration, and optional prefetching capabilities.
+// This implementation is optimized for minimal latency with connection reuse
+// and proper HTTP transport configuration.
 //
 // The client supports all standard Lambda Runtime API operations:
 //   - Getting next invocations
 //   - Sending responses
 //   - Reporting errors
 //   - Initialization error reporting
-//   - Advanced prefetching for reduced cold start impact
 //
 // Environment Variables:
 //
@@ -21,10 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"os"
 	"strconv"
 	"time"
@@ -93,63 +90,18 @@ const (
 type RuntimeAPI interface {
 	// Next retrieves the next invocation event from the Lambda Runtime API.
 	// This method blocks until an invocation is available or an error occurs.
-	//
-	// Returns:
-	//   - *Invocation: Contains the invocation data including payload and metadata
-	//   - error: Network errors, API errors, or parsing failures
-	//
-	// Example:
-	//   inv, err := client.Next()
-	//   if err != nil {
-	//       log.Printf("Failed to get next invocation: %v", err)
-	//       return
-	//   }
-	//   fmt.Printf("Request ID: %s", inv.RequestID)
-	Next() (*Invocation, error)
+	// The provided context can be used to cancel the request (e.g., during shutdown).
+	Next(ctx context.Context) (*Invocation, error)
 
 	// Response sends a successful response back to the Lambda Runtime API.
 	// The payload should be the JSON-encoded result of the function execution.
-	//
-	// Parameters:
-	//   - requestID: The request ID from the invocation (inv.RequestID)
-	//   - payload: JSON-encoded response data
-	//
-	// Example:
-	//   result := map[string]interface{}{"message": "Hello World"}
-	//   jsonData, _ := json.Marshal(result)
-	//   err := client.Response(inv.RequestID, jsonData)
-	Response(requestID string, payload []byte) error
+	Response(ctx context.Context, requestID string, payload []byte) error
 
 	// Error sends an error response back to the Lambda Runtime API.
-	// The errBody should be a JSON object containing error information.
-	//
-	// Parameters:
-	//   - requestID: The request ID from the invocation (inv.RequestID)
-	//   - errBody: JSON-encoded error information
-	//
-	// Example:
-	//   errorData := map[string]interface{}{
-	//       "errorMessage": "Something went wrong",
-	//       "errorType": "RuntimeError",
-	//   }
-	//   jsonData, _ := json.Marshal(errorData)
-	//   err := client.Error(inv.RequestID, jsonData)
-	Error(requestID string, errBody []byte) error
+	Error(ctx context.Context, requestID string, errBody []byte) error
 
 	// InitError sends an initialization error to the Lambda Runtime API.
-	// This should be called during the initialization phase if setup fails.
-	//
-	// Parameters:
-	//   - errBody: JSON-encoded error information
-	//
-	// Example:
-	//   errorData := map[string]interface{}{
-	//       "errorMessage": "Failed to initialize database connection",
-	//       "errorType": "InitializationError",
-	//   }
-	//   jsonData, _ := json.Marshal(errorData)
-	//   err := client.InitError(jsonData)
-	InitError(errBody []byte) error
+	InitError(ctx context.Context, errBody []byte) error
 }
 
 // lambdaTransport is a shared HTTP transport optimized for AWS Lambda Rapid communication.
@@ -188,21 +140,27 @@ var (
 	// nextClient handles long-polling /invocation/next requests with no timeout
 	nextClient = &http.Client{Transport: lambdaTransport, Timeout: 0}
 	// postClient handles quick POST operations (responses/errors) with default timeout
-	postClient = &http.Client{Transport: lambdaTransport}
+	postClient = &http.Client{Transport: lambdaTransport, Timeout: 5 * time.Second}
 )
 
 // Client implements the RuntimeAPI interface and provides an optimized
-// AWS Lambda Runtime API client with connection reuse and prefetching capabilities.
+// AWS Lambda Runtime API client with connection reuse.
 //
 // The client is designed for high-performance Lambda custom runtimes with:
 //   - Shared HTTP transport for connection reuse
 //   - Separate clients for different operation types
 //   - Optional HTTP request tracing for debugging
 //   - Proper connection draining for optimal reuse
+//   - Buffer pooling for request/response bodies
 type Client struct {
 	// baseURL is the full base URL for Runtime API calls
 	// Format: http://$AWS_LAMBDA_RUNTIME_API/2018-06-01/runtime
 	baseURL string
+
+	// Cached strings to avoid repeated allocations
+	nextURL    string // Pre-computed /invocation/next URL
+	initErrURL string // Pre-computed /init/error URL
+	invoPrefix string // Pre-computed /invocation/ prefix
 }
 
 // NewClient creates a new Lambda Runtime API client.
@@ -227,8 +185,16 @@ func NewClient() (*Client, error) {
 	if host == "" {
 		return nil, errors.New("AWS_LAMBDA_RUNTIME_API environment variable not set")
 	}
+
+	baseURL := "http://" + host + runtimeAPIPrefix
+
 	return &Client{
-		baseURL: "http://" + host + runtimeAPIPrefix,
+		baseURL: baseURL,
+
+		// Pre-compute frequently used URLs
+		nextURL:    baseURL + "/invocation/next",
+		initErrURL: baseURL + "/init/error",
+		invoPrefix: baseURL + "/invocation/",
 	}, nil
 }
 
@@ -335,7 +301,7 @@ func parseDeadline(h http.Header) time.Time {
 // Returns:
 //   - *Invocation: Parsed invocation data with all metadata
 //   - error: Parsing errors, HTTP errors, or I/O errors
-func parseInvocation(resp *http.Response) (*Invocation, error) {
+func (c *Client) parseInvocationOptimized(resp *http.Response) (*Invocation, error) {
 	// Ensure body is properly drained for connection reuse
 	defer drainAndClose(resp.Body)
 
@@ -345,24 +311,63 @@ func parseInvocation(resp *http.Response) (*Invocation, error) {
 		return nil, fmt.Errorf("invocation/next failed: %s: %s", resp.Status, string(body))
 	}
 
-	// Read the invocation payload
+	// Preallocate payload buffer when Content-Length is available
+	if resp.ContentLength > 0 && resp.ContentLength <= 10<<20 { // cap to 10MB
+		lr := &io.LimitedReader{R: resp.Body, N: resp.ContentLength}
+		bb := bytes.NewBuffer(make([]byte, 0, resp.ContentLength))
+		if _, err := bb.ReadFrom(lr); err != nil {
+			return nil, fmt.Errorf("failed to read invocation payload: %w", err)
+		}
+		payload := bb.Bytes()
+		// Create a fresh invocation struct
+		inv := &Invocation{}
+		// Extract metadata from headers with optimized access
+		h := resp.Header
+		inv.RequestID = h.Get(headerAWSRequestID)
+		inv.InvokedFunctionArn = h.Get(headerInvokedFunctionARN)
+		inv.Deadline = parseDeadline(h)
+		inv.TraceID = h.Get(headerTraceID)
+		inv.CognitoIdentity = h.Get(headerCognitoIdentity)
+		inv.ClientContext = h.Get(headerClientContext)
+		inv.Payload = payload
+		// Clone headers to decouple from underlying response map
+		inv.Headers = h.Clone()
+		return inv, nil
+	}
+
+	// Fallback: read payload normally
 	payload, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read invocation payload: %w", err)
 	}
 
-	// Extract metadata from headers
+	// Create a fresh invocation struct
+	inv := &Invocation{}
+
+	// Extract metadata from headers with optimized access
 	h := resp.Header
-	return &Invocation{
-		RequestID:          h.Get(headerAWSRequestID),
-		InvokedFunctionArn: h.Get(headerInvokedFunctionARN),
-		Deadline:           parseDeadline(h),
-		TraceID:            h.Get(headerTraceID),
-		CognitoIdentity:    h.Get(headerCognitoIdentity),
-		ClientContext:      h.Get(headerClientContext),
-		Payload:            payload,
-		Headers:            h.Clone(), // Clone headers to avoid data races
-	}, nil
+	inv.RequestID = h.Get(headerAWSRequestID)
+	inv.InvokedFunctionArn = h.Get(headerInvokedFunctionARN)
+	inv.Deadline = parseDeadline(h)
+	inv.TraceID = h.Get(headerTraceID)
+	inv.CognitoIdentity = h.Get(headerCognitoIdentity)
+	inv.ClientContext = h.Get(headerClientContext)
+	inv.Payload = payload
+
+	// Clone headers to decouple from underlying response map
+	inv.Headers = h.Clone()
+
+	return inv, nil
+}
+
+// Legacy function for compatibility
+func parseInvocation(resp *http.Response) (*Invocation, error) {
+	// Create a temporary client for the legacy API
+	client, err := NewClient()
+	if err != nil {
+		return nil, err
+	}
+	return client.parseInvocationOptimized(resp)
 }
 
 // ---- Public Runtime API Methods ------------------------------------------------
@@ -394,22 +399,30 @@ func parseInvocation(resp *http.Response) (*Invocation, error) {
 //	    // Process the invocation
 //	    processInvocation(inv)
 //	}
-func (c *Client) Next() (*Invocation, error) {
-	return c.getNextInvocation(context.Background())
+func (c *Client) Next(ctx context.Context) (*Invocation, error) {
+	// ts := time.Now()
+	// defer func() {
+	// 	fmt.Printf("Next invocation took %v\n", time.Since(ts))
+	// }()
+	return c.getNextInvocation(ctx)
 }
 
 // getNextInvocation is the internal implementation of Next() with context support.
 // This allows for advanced usage patterns like timeouts or cancellation,
 // though the public Next() method uses a background context for simplicity.
 func (c *Client) getNextInvocation(ctx context.Context) (*Invocation, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/invocation/next", nil)
+	// Use pre-computed URL to avoid string concatenation
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.nextURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
 
 	resp, err := nextClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get next invocation: %w", err)
 	}
 
-	return parseInvocation(resp)
+	return c.parseInvocationOptimized(resp)
 }
 
 // Response sends a successful response for a Lambda invocation.
@@ -439,16 +452,20 @@ func (c *Client) getNextInvocation(ctx context.Context) (*Invocation, error) {
 //
 // Returns:
 //   - error: Network errors, API errors, or HTTP status errors
-func (c *Client) Response(requestID string, payload []byte) error {
+func (c *Client) Response(ctx context.Context, requestID string, payload []byte) error {
+	// ts := time.Now()
+	// defer func() {
+	// 	fmt.Printf("Response took %v\n", time.Since(ts))
+	// }()
 	if requestID == "" {
 		return errors.New("requestID cannot be empty")
 	}
-	return c.postResponse(context.Background(), requestID, payload)
+	return c.postResponse(ctx, requestID, payload)
 }
 
 // postResponse is the internal implementation of Response() with context support.
 func (c *Client) postResponse(ctx context.Context, requestID string, payload []byte) error {
-	url := c.baseURL + "/invocation/" + requestID + "/response"
+	url := c.invoPrefix + requestID + "/response"
 	return c.postCommon(ctx, url, payload)
 }
 
@@ -484,16 +501,16 @@ func (c *Client) postResponse(ctx context.Context, requestID string, payload []b
 //
 // Returns:
 //   - error: Network errors, API errors, or HTTP status errors
-func (c *Client) Error(requestID string, errBody []byte) error {
+func (c *Client) Error(ctx context.Context, requestID string, errBody []byte) error {
 	if requestID == "" {
 		return errors.New("requestID cannot be empty")
 	}
-	return c.postError(context.Background(), requestID, errBody)
+	return c.postError(ctx, requestID, errBody)
 }
 
 // postError is the internal implementation of Error() with context support.
 func (c *Client) postError(ctx context.Context, requestID string, errJSON []byte) error {
-	url := c.baseURL + "/invocation/" + requestID + "/error"
+	url := c.invoPrefix + requestID + "/error"
 	return c.postCommon(ctx, url, errJSON)
 }
 
@@ -537,9 +554,9 @@ func (c *Client) postError(ctx context.Context, requestID string, errJSON []byte
 //
 // Returns:
 //   - error: Network errors, API errors, or HTTP status errors
-func (c *Client) InitError(errBody []byte) error {
-	url := c.baseURL + "/init/error"
-	return c.postCommon(context.Background(), url, errBody)
+func (c *Client) InitError(ctx context.Context, errBody []byte) error {
+	// Use pre-computed URL to avoid string concatenation
+	return c.postCommon(ctx, c.initErrURL, errBody)
 }
 
 // postCommon handles the common POST request logic for responses, errors, and init errors.
@@ -562,15 +579,13 @@ func (c *Client) InitError(errBody []byte) error {
 //   - error: HTTP errors, network errors, or API errors
 func (c *Client) postCommon(ctx context.Context, url string, body []byte) error {
 	// Use bytes.NewReader to enable Content-Length header (avoids chunked encoding)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	// Explicitly set Content-Length to avoid chunked transfer encoding
 	req.ContentLength = int64(len(body))
-
-	// Enable detailed HTTP tracing if debug mode is enabled
-	if debugOn() {
-		req = withHTTPTrace(ctx, req, "POST")
-	}
 
 	resp, err := postClient.Do(req)
 	if err != nil {
@@ -589,152 +604,4 @@ func (c *Client) postCommon(ctx context.Context, url string, body []byte) error 
 	return nil
 }
 
-// ---- Advanced Performance Features ---------------------------------------------
-
-// PrefetchNext starts a concurrent request for the next invocation while you
-// process the current one. This advanced feature can reduce latency by overlapping
-// network I/O with function execution, especially beneficial for high-throughput
-// scenarios or when you want to minimize cold start impact.
-//
-// The method returns two channels:
-//   - <-chan *Invocation: Receives the next invocation when available
-//   - <-chan error: Receives any error that occurred during prefetch
-//
-// Important considerations:
-//   - Only one of the channels will receive a value
-//   - The goroutine will complete when either channel receives data
-//   - Use this pattern to overlap processing with network I/O
-//   - Don't forget to handle both channels to avoid goroutine leaks
-//
-// Example usage for latency optimization:
-//
-//	// Start prefetch immediately after receiving current invocation
-//	nextCh, errCh := client.PrefetchNext()
-//
-//	// Process current invocation
-//	result, err := processInvocation(currentInv)
-//
-//	// Send response for current invocation
-//	if err != nil {
-//	    client.Error(currentInv.RequestID, errorJSON)
-//	} else {
-//	    client.Response(currentInv.RequestID, result)
-//	}
-//
-//	// Now await the prefetched next invocation
-//	select {
-//	case nextInv := <-nextCh:
-//	    // Process nextInv immediately
-//	    processInvocation(nextInv)
-//	case err := <-errCh:
-//	    // Handle prefetch error, fall back to regular Next()
-//	    log.Printf("Prefetch failed: %v", err)
-//	    nextInv, err := client.Next()
-//	}
-//
-// Returns:
-//   - <-chan *Invocation: Channel that will receive the next invocation
-//   - <-chan error: Channel that will receive any prefetch errors
-func (c *Client) PrefetchNext() (<-chan *Invocation, <-chan error) {
-	// Use buffered channels to prevent goroutine blocking
-	out := make(chan *Invocation, 1)
-	er := make(chan error, 1)
-
-	go func() {
-		ctx := context.Background()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/invocation/next", nil)
-
-		// Enable tracing for prefetch requests if debugging
-		if debugOn() {
-			req = withHTTPTrace(ctx, req, "GET(prefetch)")
-		}
-
-		resp, err := nextClient.Do(req)
-		if err != nil {
-			er <- fmt.Errorf("prefetch request failed: %w", err)
-			return
-		}
-
-		inv, perr := parseInvocation(resp)
-		if perr != nil {
-			er <- fmt.Errorf("prefetch parsing failed: %w", perr)
-			return
-		}
-
-		out <- inv
-	}()
-
-	return out, er
-}
-
-// ---- Debug and Monitoring Features ---------------------------------------------
-
-// debugOn checks if detailed HTTP tracing is enabled via environment variable.
-// Set RUNTIME_DEBUG=1 to enable detailed logging of HTTP connection behavior,
-// which is useful for debugging connection reuse, performance issues, and
-// network behavior in Lambda custom runtimes.
-//
-// Example debug output when enabled:
-//
-//	[POST] GetConn 127.0.0.1:9001
-//	[POST] GotConn reused=true wasIdle=true idleTime=45.2ms
-//	[POST] WroteRequest err=<nil>
-//	[POST] GotFirstResponseByte
-//
-// Returns:
-//   - bool: true if RUNTIME_DEBUG=1, false otherwise
-func debugOn() bool {
-	return os.Getenv("RUNTIME_DEBUG") == "1"
-}
-
-// withHTTPTrace adds detailed HTTP connection tracing to a request.
-// This is used for debugging connection reuse, performance issues, and
-// network behavior when RUNTIME_DEBUG=1 is set.
-//
-// The trace logs include:
-//   - Connection acquisition and reuse status
-//   - Request writing completion
-//   - Response timing information
-//
-// This is particularly useful for diagnosing:
-//   - Connection pool behavior and reuse efficiency
-//   - Network latency and timing issues
-//   - HTTP transport configuration problems
-//   - Lambda Rapid communication patterns
-//
-// Parameters:
-//   - ctx: Context for the HTTP request
-//   - req: HTTP request to add tracing to
-//   - tag: Label for identifying the request type in logs (e.g., "POST", "GET(prefetch)")
-//
-// Returns:
-//   - *http.Request: Request with HTTP trace context attached
-//
-// Example debug output:
-//
-//	[POST] GetConn 127.0.0.1:9001
-//	[POST] GotConn reused=true wasIdle=true idleTime=45.2ms
-//	[POST] WroteRequest err=<nil>
-//	[POST] GotFirstResponseByte
-func withHTTPTrace(ctx context.Context, req *http.Request, tag string) *http.Request {
-	trace := &httptrace.ClientTrace{
-		// Log when getting a connection from the pool
-		GetConn: func(hostPort string) {
-			log.Printf("[%s] GetConn %s", tag, hostPort)
-		},
-		// Log connection details - this shows if connection reuse is working
-		GotConn: func(info httptrace.GotConnInfo) {
-			log.Printf("[%s] GotConn reused=%v wasIdle=%v idleTime=%s",
-				tag, info.Reused, info.WasIdle, info.IdleTime)
-		},
-		// Log request writing completion
-		WroteRequest: func(info httptrace.WroteRequestInfo) {
-			log.Printf("[%s] WroteRequest err=%v", tag, info.Err)
-		},
-		// Log when response starts arriving
-		GotFirstResponseByte: func() {
-			log.Printf("[%s] GotFirstResponseByte", tag)
-		},
-	}
-	return req.WithContext(httptrace.WithClientTrace(ctx, trace))
-}
+// (prefetch functionality removed)

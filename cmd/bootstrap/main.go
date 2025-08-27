@@ -58,9 +58,9 @@ func (h *Handler) Validate(ctx context.Context, e Input) error {
 
 func (h *Handler) Handler(ctx context.Context, e Input) (Output, error) {
 	// Access any environment variable via the All map
-	if reqCtx, ok := runtime.FromContext(ctx); ok {
-		h.log.Info(ctx, "request context", "aws_request_id", reqCtx.AwsRequestID)
-	}
+	// if reqCtx, ok := runtime.FromContext(ctx); ok {
+	// 	h.log.Info(ctx, "request context", "aws_request_id", reqCtx.AwsRequestID)
+	// }
 
 	return Output{Input: e.Input, Output: e.Input}, nil
 }
